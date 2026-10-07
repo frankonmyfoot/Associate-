@@ -18,6 +18,12 @@ export default function SiteHeader({ hasClerk }: { hasClerk: boolean }) {
           <span className="text-xl font-bold">AssociateAI</span>
         </Link>
         <nav className="flex items-center gap-4">
+          <Link
+            to="/pricing"
+            className="text-sm font-medium text-muted-foreground hover:text-foreground"
+          >
+            Pricing
+          </Link>
           {hasClerk ? (
             <>
               <SignedOut>

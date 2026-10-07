@@ -86,6 +86,27 @@ const SCHEMA_STATEMENTS = [
 
 let schemaPromise: Promise<void> | null = null;
 
+/**
+ * Adds billing columns to `firms` if missing (SQLite has no IF NOT EXISTS for
+ * ADD COLUMN — check pragma, then alter). Idempotent and cached per process.
+ */
+async function migrateBillingColumns(): Promise<void> {
+  const cols = await query<{ name: string }>(
+    "SELECT name FROM pragma_table_info('firms')",
+  );
+  const have = new Set(cols.map((c) => c.name));
+  const wanted: Array<[string, string]> = [
+    ["stripe_customer_id", "TEXT"],
+    ["subscription_status", "TEXT"],
+    ["current_period_end", "TEXT"],
+  ];
+  for (const [name, type] of wanted) {
+    if (!have.has(name)) {
+      await execute(`ALTER TABLE firms ADD COLUMN ${name} ${type}`);
+    }
+  }
+}
+
 /** Runs the idempotent schema once per process; safe to await before any query. */
 export function ensureSchema(): Promise<void> {
   if (!schemaPromise) {
@@ -93,6 +114,7 @@ export function ensureSchema(): Promise<void> {
       for (const stmt of SCHEMA_STATEMENTS) {
         await execute(stmt);
       }
+      await migrateBillingColumns();
     })().catch((err) => {
       schemaPromise = null; // allow retry after a transient failure
       throw err;

@@ -1,8 +1,13 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { useState } from "react";
+import { createFileRoute, useRouter } from "@tanstack/react-router";
 
-import { getSettingsData } from "~/lib/server";
+import { getSettingsData, startPortal, startCheckout } from "~/lib/server";
+import { fmtDate } from "~/lib/fmt";
 
 export const Route = createFileRoute("/dashboard/settings")({
+  validateSearch: (search: Record<string, unknown>) => ({
+    billing: typeof search.billing === "string" ? search.billing : undefined,
+  }),
   loader: async () => {
     try {
       return await getSettingsData();
@@ -30,6 +35,10 @@ const PLAN_LABELS: Record<string, string> = {
 
 function SettingsPage() {
   const data = Route.useLoaderData();
+  const router = useRouter();
+  const search = Route.useSearch();
+  const [billingBusy, setBillingBusy] = useState(false);
+  const [billingMessage, setBillingMessage] = useState("");
 
   if (data.mode === "no-firm") {
     return (
@@ -38,6 +47,47 @@ function SettingsPage() {
       </div>
     );
   }
+
+  const handlePortal = async () => {
+    setBillingBusy(true);
+    setBillingMessage("");
+    try {
+      const result = await startPortal();
+      if (result.ok) {
+        window.location.href = result.url;
+      } else {
+        setBillingMessage(result.message);
+        setBillingBusy(false);
+      }
+    } catch (err) {
+      setBillingMessage(
+        err instanceof Error ? err.message : "Couldn't open the billing portal.",
+      );
+      setBillingBusy(false);
+    }
+  };
+
+  const handleUpgrade = async () => {
+    setBillingBusy(true);
+    setBillingMessage("");
+    try {
+      const result = await startCheckout({ data: { plan: "pro" } });
+      if (result.ok) {
+        window.location.href = result.url;
+      } else {
+        setBillingMessage(result.message);
+        setBillingBusy(false);
+      }
+    } catch (err) {
+      setBillingMessage(
+        err instanceof Error ? err.message : "Checkout couldn't be started.",
+      );
+      setBillingBusy(false);
+    }
+  };
+
+  const { billing } = data;
+  const subscribed = Boolean(billing.subscriptionStatus) && billing.subscriptionStatus !== "canceled";
 
   return (
     <div className="max-w-3xl">
@@ -158,18 +208,65 @@ function SettingsPage() {
 
         <div className="rounded-xl border p-6">
           <h2 className="text-lg font-semibold">Plan &amp; Billing</h2>
+
+          {search.billing === "success" && (
+            <p className="mt-3 rounded-lg border bg-green-50 px-4 py-3 text-sm text-green-800">
+              Subscription activated — thanks for upgrading! It may take a
+              moment for your plan to show here.
+            </p>
+          )}
+
+          {billingMessage && (
+            <p className="mt-3 rounded-lg border bg-yellow-50 px-4 py-3 text-sm text-yellow-800">
+              {billingMessage}
+            </p>
+          )}
+
           <p className="mt-1 text-sm text-muted-foreground">
-            You are on the <strong>{PLAN_LABELS[data.firm.plan] ?? "Starter"}</strong> plan.
-            Upgrades will be available once billing is connected.
+            You are on the <strong>{PLAN_LABELS[data.firm.plan] ?? "Starter"}</strong> plan
+            {subscribed ? (
+              <>
+                {" "}· subscription{" "}
+                <span className="font-medium">{billing.subscriptionStatus}</span>
+                {billing.currentPeriodEnd &&
+                  `, renews ${fmtDate(billing.currentPeriodEnd)}`}
+              </>
+            ) : (
+              " · no active subscription yet"
+            )}
+            .
           </p>
-          <div className="mt-4">
-            <button
-              type="button"
-              disabled
-              className="cursor-not-allowed rounded-lg border px-4 py-2 text-sm font-medium opacity-50"
-            >
-              Upgrade (Coming Soon)
-            </button>
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            {billing.stripeConfigured ? (
+              <>
+                {billing.hasCustomer && (
+                  <button
+                    type="button"
+                    onClick={handlePortal}
+                    disabled={billingBusy}
+                    className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+                  >
+                    {billingBusy ? "Opening..." : "Manage Billing"}
+                  </button>
+                )}
+                {data.firm.plan !== "pro" && data.firm.plan !== "enterprise" && (
+                  <button
+                    type="button"
+                    onClick={handleUpgrade}
+                    disabled={billingBusy}
+                    className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+                  >
+                    Upgrade to Pro ($149/mo)
+                  </button>
+                )}
+              </>
+            ) : (
+              <span className="rounded-lg border bg-muted/30 px-4 py-2 text-sm text-muted-foreground">
+                Billing is coming online — checkout opens as soon as the
+                Stripe account is connected.
+              </span>
+            )}
           </div>
         </div>
       </div>

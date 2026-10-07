@@ -10,6 +10,7 @@
 // the takeover works across user boundaries.
 import handler from "./dist/server/server.js";
 import { buildHealthResponse } from "./src/lib/health";
+import { handleStripeWebhook } from "./src/lib/billing";
 
 // Pinned, NOT read from the environment. The published preview URL
 // (<label>.<PUBLIC_SITE_DOMAIN>) is reverse-proxied to 0.0.0.0:3000 inside the
@@ -56,6 +57,30 @@ for (let attempt = 1; ; attempt++) {
         // (see src/lib/health.ts for why it lives here).
         if (pathname === "/api/public/health") {
           return buildHealthResponse(req);
+        }
+        // Stripe webhook (raw POST endpoint). Signature verification needs the
+        // RAW body exactly as the gateway received it, which the SSR handler
+        // would re-serialize — so it's intercepted here before parsing.
+        // CAVEAT: this assumes the platform gateway proxies the request body
+        // byte-for-byte (observed: it does for health + SSR payloads). If a
+        // future gateway change re-signs/normalizes bodies, verification will
+        // fail with 400 "Webhook signature verification failed" and Stripe
+        // will retry until the gateway passes raw bodies through.
+        if (pathname === "/api/billing/webhook") {
+          const signature = req.headers.get("stripe-signature");
+          const raw = await req.text();
+          const result = await handleStripeWebhook(raw, signature);
+          return new Response(
+            JSON.stringify(
+              result.handled
+                ? { received: true }
+                : { error: result.message },
+            ),
+            {
+              status: result.handled ? 200 : result.status,
+              headers: { "Content-Type": "application/json" },
+            },
+          );
         }
         if (pathname !== "/") {
           const file = Bun.file(CLIENT_DIR + pathname);

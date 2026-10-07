@@ -29,6 +29,14 @@ import {
 } from "~/lib/db";
 import { generateDocument } from "~/lib/ai";
 import { getDocumentType } from "~/lib/documents";
+import {
+  billingConfigured,
+  createCheckoutSession,
+  createPortalSession,
+  priceIdFor,
+  type PurchasablePlan,
+} from "~/lib/billing";
+import { PLANS, type PlanId } from "~/lib/plans";
 import type { DocumentType, IntakeField, IntakeFieldType } from "~/lib/types";
 
 // ─── Clerk configuration ──────────────────────────────────────
@@ -188,12 +196,68 @@ async function firmForUser(userId: string) {
     name: string;
     plan: string;
     slug: string;
+    stripe_customer_id: string | null;
+    subscription_status: string | null;
+    current_period_end: string | null;
   }>(
-    `SELECT f.id, f.name, f.plan, f.slug FROM firms f
+    `SELECT f.id, f.name, f.plan, f.slug, f.stripe_customer_id, f.subscription_status, f.current_period_end
+     FROM firms f
      JOIN firm_users fu ON fu.firm_id = f.id
      WHERE fu.clerk_user_id = '${esc(userId)}' LIMIT 1`,
   );
   return rows[0] ?? null;
+}
+
+// ─── Plan gating ─────────────────────────────────────────────
+
+type LimitKind = "users" | "intakeSubmissions" | "documentGenerations";
+
+const UPGRADE_HINT = "View plans at /pricing or ask your firm admin to upgrade.";
+
+/**
+ * Enforces the firm's plan limits (read from the firm record, not Clerk).
+ * Throws a friendly, user-facing message — never a raw error/stack. Pro (and
+ * Enterprise) are unlimited; Starter: 3 users, 100 intakes/mo, 50 docs/mo.
+ */
+async function assertWithinPlanLimit(
+  firm: { id: string; plan: string },
+  kind: LimitKind,
+): Promise<void> {
+  const plan = PLANS[firm.plan as PlanId] ?? PLANS.starter;
+  const limit =
+    kind === "users"
+      ? plan.limits.users
+      : kind === "intakeSubmissions"
+        ? plan.limits.intakeSubmissionsPerMonth
+        : plan.limits.documentGenerationsPerMonth;
+  if (limit === -1) return; // unlimited
+
+  let used: number;
+  if (kind === "users") {
+    const rows = await query<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM firm_users WHERE firm_id = '${esc(firm.id)}'`,
+    );
+    used = Number(rows[0]?.count ?? 0);
+  } else {
+    const table = kind === "intakeSubmissions" ? "intake_submissions" : "document_drafts";
+    const rows = await query<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM ${table}
+       WHERE firm_id = '${esc(firm.id)}' AND substr(created_at, 1, 7) = substr(datetime('now'), 1, 7)`,
+    );
+    used = Number(rows[0]?.count ?? 0);
+  }
+
+  if (used >= limit) {
+    const what =
+      kind === "users"
+        ? "team members"
+        : kind === "intakeSubmissions"
+          ? "monthly intake submissions"
+          : "monthly document generations";
+    throw new Error(
+      `Your firm is on the ${plan.name} plan and has used all ${limit} ${what} this month. ${UPGRADE_HINT}`,
+    );
+  }
 }
 
 export interface DashboardAuthState {
@@ -541,6 +605,26 @@ export const submitIntake = createServerFn({ method: "POST" })
     const fields = parseJson<IntakeField[]>(forms[0].fields, []);
     const firmId = text(forms[0].firm_id);
 
+    // Plan gating (public flow: no pricing link in the message — the visitor
+    // isn't a firm user; the firm sees the upgrade prompt in the dashboard).
+    const firmRows = await query<{ plan: string }>(
+      `SELECT plan FROM firms WHERE id = '${esc(firmId)}'`,
+    );
+    const limit =
+      PLANS[(firmRows[0]?.plan as PlanId) ?? "starter"]?.limits
+        .intakeSubmissionsPerMonth ?? -1;
+    if (limit !== -1) {
+      const used = await query<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM intake_submissions
+         WHERE firm_id = '${esc(firmId)}' AND substr(created_at, 1, 7) = substr(datetime('now'), 1, 7)`,
+      );
+      if (Number(used[0]?.count ?? 0) >= limit) {
+        throw new Error(
+          `This firm has reached its plan's limit of ${limit} intake submissions this month. The form is temporarily paused — please contact the firm.`,
+        );
+      }
+    }
+
     // Only accept values for known field ids; cap each value's size.
     const submittedData: Record<string, string> = {};
     for (const field of fields) {
@@ -687,6 +771,9 @@ export const generateDocumentFn = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const userId = await currentUserId();
     if (!userId) throw new Error("Please sign in to generate documents.");
+    const firm = await firmForUser(userId);
+    if (!firm) throw new Error("Complete onboarding before generating documents.");
+    await assertWithinPlanLimit(firm, "documentGenerations");
     if (!getDocumentType(data.documentType))
       throw new Error("Unknown document type");
     const caseDetails: Record<string, string> = {};
@@ -717,6 +804,7 @@ export const saveDocument = createServerFn({ method: "POST" })
     const userId = await currentUserId();
     const firm = userId ? await firmForUser(userId) : null;
     if (!firm) throw new Error("Please sign in to save documents.");
+    await assertWithinPlanLimit(firm, "documentGenerations");
     if (!getDocumentType(data.documentType))
       throw new Error("Unknown document type");
     const id = generateId();
@@ -850,6 +938,12 @@ export const getSettingsData = createServerFn({ method: "GET" }).handler(
         teamSize: f.team_size == null ? "" : String(f.team_size),
         firmId: text(f.id),
       },
+      billing: {
+        stripeConfigured: billingConfigured().configured,
+        stripeCustomerId: text(f.stripe_customer_id),
+        subscriptionStatus: text(f.subscription_status),
+        currentPeriodEnd: text(f.current_period_end),
+      },
       members: members.map((m) => ({
         id: text(m.id),
         email: text(m.email),
@@ -879,3 +973,80 @@ export const setFormActive = createServerFn({ method: "POST" })
     );
     return { ok: true };
   });
+
+// ─── Billing (Stripe, key-optional) ───────────────────────────
+
+export interface BillingConfigState {
+  configured: boolean;
+  /** For the signed-in firm (null when signed out). */
+  plan: string | null;
+  subscriptionStatus: string | null;
+  currentPeriodEnd: string | null;
+  hasCustomer: boolean;
+}
+
+export const getBillingConfig = createServerFn({
+  method: "GET",
+}).handler(async (): Promise<BillingConfigState> => {
+  await ensureSchema();
+  const configured = billingConfigured().configured;
+  const userId = await currentUserId();
+  const firm = userId ? await firmForUser(userId) : null;
+  return {
+    configured,
+    plan: firm?.plan ?? null,
+    subscriptionStatus: firm?.subscription_status ?? null,
+    currentPeriodEnd: firm?.current_period_end ?? null,
+    hasCustomer: Boolean(firm?.stripe_customer_id),
+  };
+});
+
+function requestOrigin(): string {
+  try {
+    return new URL(getRequest().url).origin;
+  } catch {
+    return "";
+  }
+}
+
+export const startCheckout = createServerFn({ method: "POST" })
+  .validator(
+    (input: unknown) => input as { plan: "starter" | "pro"; userEmail?: string },
+  )
+  .handler(async ({ data }) => {
+    const userId = await currentUserId();
+    const firm = userId ? await firmForUser(userId) : null;
+    if (!firm) throw new Error("Please sign in to subscribe.");
+    // Price IDs must be configured even when the secret key is present.
+    if (!priceIdFor(data.plan)) {
+      return {
+        ok: false as const,
+        message:
+          "Billing isn't fully configured yet — the plan price ID hasn't been set by the owner.",
+      };
+    }
+    const result = await createCheckoutSession({
+      firmId: firm.id,
+      firmName: firm.name,
+      customerEmail: (data.userEmail ?? "").trim(),
+      plan: data.plan as PurchasablePlan,
+      origin: requestOrigin(),
+      existingCustomerId: firm.stripe_customer_id ?? null,
+    });
+    if (!result.ok) return { ok: false as const, message: result.message };
+    return { ok: true as const, url: result.url };
+  });
+
+export const startPortal = createServerFn({ method: "POST" }).handler(
+  async () => {
+    const userId = await currentUserId();
+    const firm = userId ? await firmForUser(userId) : null;
+    if (!firm) throw new Error("Please sign in first.");
+    const result = await createPortalSession({
+      customerId: firm.stripe_customer_id ?? null,
+      origin: requestOrigin(),
+    });
+    if (!result.ok) return { ok: false as const, message: result.message };
+    return { ok: true as const, url: result.url };
+  },
+);
