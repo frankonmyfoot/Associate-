@@ -19,15 +19,8 @@ export const Route = createFileRoute("/onboarding")({
 
 export default function OnboardingPage() {
   const { clerkKey } = Route.useLoaderData();
-  const navigate = useNavigate();
-  const { user, isLoaded } = useUser();
-  const [step, setStep] = useState(1);
-  const [firmName, setFirmName] = useState("");
-  const [practiceAreas, setPracticeAreas] = useState("");
-  const [teamSize, setTeamSize] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState("");
 
+  // No Clerk hooks above this gate — useUser() throws without a provider.
   if (!clerkKey) {
     return (
       <GatePanel
@@ -36,6 +29,18 @@ export default function OnboardingPage() {
       />
     );
   }
+  return <OnboardingWizard />;
+}
+
+function OnboardingWizard() {
+  const navigate = useNavigate();
+  const { user, isLoaded } = useUser();
+  const [step, setStep] = useState(1);
+  const [firmName, setFirmName] = useState("");
+  const [practiceAreas, setPracticeAreas] = useState("");
+  const [teamSize, setTeamSize] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState("");
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
