@@ -541,12 +541,7 @@ export const getIntakeFormDetail = createServerFn({ method: "GET" })
       `SELECT id, case_summary, status, created_at FROM intake_submissions
        WHERE form_id = '${esc(data.formId)}' ORDER BY created_at DESC`,
     );
-    let origin = "";
-    try {
-      origin = new URL(getRequest().url).origin;
-    } catch {
-      origin = "";
-    }
+    const origin = requestOrigin();
     return {
       mode: "ok",
       form: {
@@ -1003,7 +998,17 @@ export const getBillingConfig = createServerFn({
 
 function requestOrigin(): string {
   try {
-    return new URL(getRequest().url).origin;
+    const req = getRequest();
+    // Behind the platform proxy the raw request URL can carry an internal
+    // scheme/host, while the forwarded headers carry the public origin the
+    // browser actually sees. Prefer the forwarded values when present so
+    // absolute URLs we hand out (Stripe success/cancel/return URLs, intake
+    // share links) always point at the public site.
+    const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim();
+    const fwdHost = req.headers.get("x-forwarded-host")?.split(",")[0]?.trim();
+    const host = fwdHost || req.headers.get("host");
+    if (proto && host) return `${proto}://${host}`;
+    return new URL(req.url).origin;
   } catch {
     return "";
   }
@@ -1016,7 +1021,10 @@ export const startCheckout = createServerFn({ method: "POST" })
   .handler(async ({ data }) => {
     const userId = await currentUserId();
     const firm = userId ? await firmForUser(userId) : null;
-    if (!firm) throw new Error("Please sign in to subscribe.");
+    if (!firm)
+      throw new Error(
+        "Your firm isn't set up yet — finish onboarding first, then subscribe.",
+      );
     // Price IDs must be configured even when the secret key is present.
     if (!priceIdFor(data.plan)) {
       return {

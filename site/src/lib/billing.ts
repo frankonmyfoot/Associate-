@@ -22,12 +22,16 @@ export function billingConfigured(): BillingConfigured {
 }
 
 let stripeClient: Stripe | null = null;
-
+let stripeClientKey: string | null = null;
 function getStripe(): Stripe | null {
   const key = process.env.STRIPE_SECRET_KEY;
   if (!key) return null;
-  if (!stripeClient) {
+  // Rebuild the client when the key changes (env keys can be swapped after
+  // process start) — a cached client pinned to the old key would silently
+  // keep operating against the wrong Stripe account.
+  if (!stripeClient || stripeClientKey !== key) {
     stripeClient = new Stripe(key);
+    stripeClientKey = key;
   }
   return stripeClient;
 }
