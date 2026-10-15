@@ -5,10 +5,8 @@ import {
   Scripts,
   createRootRoute,
 } from "@tanstack/react-router";
-import { ClerkProvider } from "@clerk/clerk-react";
 import type { ReactNode } from "react";
 
-import { getPublicConfig } from "~/lib/server";
 import appCss from "~/styles/app.css?url";
 
 export const Route = createRootRoute({
@@ -25,19 +23,6 @@ export const Route = createRootRoute({
     ],
     links: [{ rel: "stylesheet", href: appCss }],
   }),
-  // The Clerk publishable key is resolved server-side at REQUEST time (the
-  // platform injects keys into the serving process env), then passed to
-  // ClerkProvider as a prop through the SSR'd loader data — so the client
-  // bundle never needs build-time env access. Key-optional: without a key we
-  // render the app without Clerk (honest placeholder states on auth pages).
-  loader: async () => {
-    try {
-      const cfg = await getPublicConfig();
-      return { clerkPublishableKey: cfg.clerkPublishableKey };
-    } catch {
-      return { clerkPublishableKey: null };
-    }
-  },
   notFoundComponent: () => (
     <div className="flex min-h-screen flex-col items-center justify-center gap-4 px-4 text-center">
       <p className="text-2xl font-bold">Page not found</p>
@@ -57,17 +42,9 @@ export const Route = createRootRoute({
 });
 
 function RootComponent() {
-  const { clerkPublishableKey } = Route.useLoaderData();
-
   return (
     <RootDocument>
-      {clerkPublishableKey ? (
-        <ClerkProvider publishableKey={clerkPublishableKey}>
-          <Outlet />
-        </ClerkProvider>
-      ) : (
-        <Outlet />
-      )}
+      <Outlet />
     </RootDocument>
   );
 }

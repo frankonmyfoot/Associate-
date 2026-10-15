@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { createFileRoute, useRouter } from "@tanstack/react-router";
 
-import { getSettingsData, startPortal, startCheckout } from "~/lib/server";
+import { getSettingsData, startPortal, startCheckout, saveOpenAiKey, clearOpenAiKey, testOpenAiKey } from "~/lib/server";
 import { fmtDate } from "~/lib/fmt";
 
 export const Route = createFileRoute("/dashboard/settings")({
@@ -39,6 +39,11 @@ function SettingsPage() {
   const search = Route.useSearch();
   const [billingBusy, setBillingBusy] = useState(false);
   const [billingMessage, setBillingMessage] = useState("");
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiMessage, setAiMessage] = useState<{ ok: boolean; text: string } | null>(
+    null,
+  );
 
   if (data.mode === "no-firm") {
     return (
@@ -47,6 +52,71 @@ function SettingsPage() {
       </div>
     );
   }
+
+  const invalidate = () => {
+    void router.invalidate();
+  };
+
+  const handleSaveKey = async () => {
+    setAiBusy(true);
+    setAiMessage(null);
+    try {
+      const result = await saveOpenAiKey({ data: { apiKey: apiKeyInput } });
+      if (result.ok) {
+        setApiKeyInput("");
+        setAiMessage({
+          ok: true,
+          text: `Key saved (${result.maskedKey}). It stays server-side and is used for this firm's drafting and intake summaries.`,
+        });
+        invalidate();
+      }
+    } catch (err) {
+      setAiMessage({
+        ok: false,
+        text: err instanceof Error ? err.message : "Couldn't save the key.",
+      });
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const handleTestKey = async () => {
+    setAiBusy(true);
+    setAiMessage(null);
+    try {
+      const result = await testOpenAiKey();
+      setAiMessage({ ok: result.ok, text: result.message });
+    } catch (err) {
+      setAiMessage({
+        ok: false,
+        text: err instanceof Error ? err.message : "Test failed.",
+      });
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const handleClearKey = async () => {
+    setAiBusy(true);
+    setAiMessage(null);
+    try {
+      const result = await clearOpenAiKey();
+      if (result.ok) {
+        setAiMessage({
+          ok: true,
+          text: "Key removed. Drafting falls back to templates (or the platform key, if one exists).",
+        });
+        invalidate();
+      }
+    } catch (err) {
+      setAiMessage({
+        ok: false,
+        text: err instanceof Error ? err.message : "Couldn't remove the key.",
+      });
+    } finally {
+      setAiBusy(false);
+    }
+  };
 
   const handlePortal = async () => {
     setBillingBusy(true);
@@ -152,6 +222,77 @@ function SettingsPage() {
                 className="mt-1 block w-full rounded-lg border bg-muted/20 px-3 py-2 font-mono text-xs"
               />
             </div>
+          </div>
+        </div>
+
+        <div className="rounded-xl border p-6">
+          <h2 className="text-lg font-semibold">AI Drafting</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            Connect your firm's own OpenAI API key to activate real AI drafting
+            and AI intake summaries. The key is stored server-side and never
+            exposed to the browser. Without one, drafting uses built-in
+            templates{data.ai.platformKeyPresent ? " or the platform's shared key" : ""}.
+          </p>
+
+          {data.ai.byoConfigured && (
+            <p className="mt-3 text-sm">
+              Current key:{" "}
+              <code className="rounded bg-muted px-2 py-0.5 text-xs">
+                {data.ai.maskedKey}
+              </code>
+            </p>
+          )}
+
+          {aiMessage && (
+            <p
+              className={`mt-3 rounded-lg border px-4 py-3 text-sm ${
+                aiMessage.ok
+                  ? "border-green-200 bg-green-50 text-green-800"
+                  : "border-red-200 bg-red-50 text-red-700"
+              }`}
+            >
+              {aiMessage.text}
+            </p>
+          )}
+
+          <div className="mt-4 flex flex-col gap-3 sm:flex-row">
+            <input
+              type="password"
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              className="flex-1 rounded-lg border px-3 py-2 text-sm"
+              placeholder={data.ai.byoConfigured ? "Replace with a new key (sk-…)" : "Paste your OpenAI API key (sk-…)"}
+              autoComplete="off"
+            />
+            <button
+              type="button"
+              onClick={handleSaveKey}
+              disabled={aiBusy || !apiKeyInput.trim()}
+              className="rounded-lg bg-primary-600 px-4 py-2 text-sm font-medium text-white hover:bg-primary-700 disabled:opacity-50"
+            >
+              {aiBusy ? "Working..." : "Save Key"}
+            </button>
+          </div>
+
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={handleTestKey}
+              disabled={aiBusy}
+              className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50"
+            >
+              {aiBusy ? "Testing..." : "Test Connection"}
+            </button>
+            {data.ai.byoConfigured && (
+              <button
+                type="button"
+                onClick={handleClearKey}
+                disabled={aiBusy}
+                className="rounded-lg border px-4 py-2 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50"
+              >
+                Remove Key
+              </button>
+            )}
           </div>
         </div>
 
