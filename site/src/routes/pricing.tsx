@@ -1,26 +1,25 @@
 import { Link, createFileRoute, useRouter } from "@tanstack/react-router";
-import { useUser } from "@clerk/clerk-react";
 import { useState } from "react";
 
 import SiteHeader from "~/components/site-header";
-import { getBillingConfig, getPublicConfig, startCheckout } from "~/lib/server";
+import { getBillingConfig, getSessionUser, startCheckout } from "~/lib/server";
 import { PLANS, PLAN_ORDER } from "~/lib/plans";
 
 export const Route = createFileRoute("/pricing")({
   loader: async () => {
     try {
-      const [cfg, billing] = await Promise.all([
-        getPublicConfig(),
+      const [user, billing] = await Promise.all([
+        getSessionUser(),
         getBillingConfig(),
       ]);
       return {
-        hasClerk: Boolean(cfg.clerkPublishableKey),
+        user,
         billingConfigured: billing.configured,
         firmPlan: billing.plan,
       };
     } catch {
       return {
-        hasClerk: false,
+        user: null,
         billingConfigured: false,
         firmPlan: null,
       };
@@ -34,7 +33,7 @@ function PricingPage() {
 
   return (
     <div className="flex min-h-screen flex-col">
-      <SiteHeader hasClerk={data.hasClerk} />
+      <SiteHeader user={data.user} />
 
       <section className="flex-1">
         <div className="mx-auto max-w-7xl px-4 py-16 sm:px-6 lg:px-8">
@@ -47,10 +46,9 @@ function PricingPage() {
           </div>
 
           {/* The plan grid always renders (public marketing); only the
-              checkout interaction is Clerk-gated — useUser() throws without a
-              provider, so it lives in a component mounted only when keys exist. */}
+              checkout interaction is auth-gated. */}
           <PricingPlanGrid
-            hasClerk={data.hasClerk}
+            signedIn={Boolean(data.user)}
             billingConfigured={data.billingConfigured}
             firmPlan={data.firmPlan}
           />
@@ -67,11 +65,11 @@ function PricingPage() {
 }
 
 function PricingPlanGrid({
-  hasClerk,
+  signedIn,
   billingConfigured,
   firmPlan,
 }: {
-  hasClerk: boolean;
+  signedIn: boolean;
   billingConfigured: boolean;
   firmPlan: string | null;
 }) {
@@ -146,7 +144,7 @@ function PricingPlanGrid({
                       >
                         Contact Us
                       </Link>
-                    ) : billingConfigured && hasClerk ? (
+                    ) : billingConfigured && signedIn ? (
                       <SubscribeButton
                         plan={planId as "starter" | "pro"}
                         label={`Subscribe to ${plan.name}`}
@@ -168,8 +166,8 @@ function PricingPlanGrid({
                           Get Started
                         </Link>
                         <p className="mt-2 text-xs text-muted-foreground">
-                          Billing is coming online — checkout opens as soon as
-                          the Stripe account is connected.
+                          Want in today? Reach out — early firms are onboarded
+                          personally.
                         </p>
                       </div>
                     )}
@@ -196,7 +194,7 @@ function PricingPlanGrid({
   );
 }
 
-/** Mounted ONLY when a ClerkProvider exists (uses useUser). */
+/** Starts Stripe checkout; routes signed-out visitors to sign-up first. */
 function SubscribeButton({
   plan,
   label,
@@ -207,22 +205,14 @@ function SubscribeButton({
   onError: (message: string) => void;
 }) {
   const router = useRouter();
-  const { user } = useUser();
   const [busy, setBusy] = useState(false);
 
   const start = async () => {
     onError("");
-    if (!user) {
-      await router.navigate({ to: "/sign-up" });
-      return;
-    }
     setBusy(true);
     try {
       const result = await startCheckout({
-        data: {
-          plan,
-          userEmail: user.primaryEmailAddress?.emailAddress ?? "",
-        },
+        data: { plan },
       });
       if (result.ok) {
         window.location.href = result.url;

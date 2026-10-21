@@ -1,16 +1,21 @@
 /**
- * AI integration for document generation.
+ * AI integration for document generation and intake summaries.
  *
- * Supports OpenAI and Anthropic APIs.
- * Falls back to template-based generation if no API key is configured.
+ * Supports OpenAI and Anthropic APIs. Falls back to template-based generation
+ * if no API key is available.
+ *
+ * Key resolution (per call — keys can change between process start and a
+ * request): the caller passes the already-resolved key, preferring the firm's
+ * own BYO OpenAI key over the platform OPENAI_API_KEY env var (see
+ * `resolveOpenAiKey` in server.ts). Only server code ever sees a key.
  */
 
 import { getDocumentType, type DocumentType } from "./documents";
+import type { IntakeField } from "./types";
 
 // ─── Configuration ────────────────────────────────────────────
 
-// Keys are read lazily (per call) — the platform injects them into the serving
-// process's env, which can change between process start and a request.
+// Env fallback — read lazily (per call).
 function openAiKey(): string | undefined {
   return process.env.OPENAI_API_KEY;
 }
@@ -27,6 +32,11 @@ export interface GenerateDocumentParams {
   sourceSubmissionId?: string;
 }
 
+export interface GenerateOptions {
+  /** Resolved OpenAI key (firm BYO key preferred, else platform env key). */
+  openAiKey?: string | null;
+}
+
 export interface GenerateDocumentResult {
   content: string;
   model: string;
@@ -36,16 +46,18 @@ export interface GenerateDocumentResult {
 
 export async function generateDocument(
   params: GenerateDocumentParams,
+  opts: GenerateOptions = {},
 ): Promise<GenerateDocumentResult> {
   const config = getDocumentType(params.documentType);
   if (!config) {
     throw new Error(`Unknown document type: ${params.documentType}`);
   }
 
-  // Try OpenAI first
-  if (openAiKey()) {
+  // Try OpenAI first (firm BYO key preferred over the platform env key)
+  const openAi = opts.openAiKey?.trim() || openAiKey();
+  if (openAi) {
     try {
-      return await generateWithOpenAI(config.systemPrompt, params.caseDetails);
+      return await generateWithOpenAI(config.systemPrompt, params.caseDetails, openAi);
     } catch (error) {
       console.warn("OpenAI generation failed, trying fallback:", error);
     }
@@ -64,11 +76,113 @@ export async function generateDocument(
   return generateWithTemplate(config, params.caseDetails);
 }
 
+// ─── Intake case summary (AI) ─────────────────────────────────
+
+/**
+ * AI-written case summary for an intake submission. Throws on failure — the
+ * caller falls back to the deterministic summary so submissions never break.
+ */
+export async function generateIntakeSummary(
+  apiKey: string,
+  data: Record<string, string>,
+  fields: IntakeField[],
+): Promise<string> {
+  const fieldLines = fields
+    .slice(0, 50)
+    .map((f) => `- ${f.label} (${f.type}): ${data[f.id]?.trim() || "(not provided)"}`)
+    .join("\n");
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      max_tokens: 300,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You summarize law-firm client intake submissions into concise case summaries (max ~120 words) for the supervising attorney. Include the client's identity and contact info when present, the matter type, the key facts, and anything time-sensitive. Plain text only — no preamble, no markdown.",
+        },
+        {
+          role: "user",
+          content: `Summarize this intake submission:\n\n${fieldLines}`,
+        },
+      ],
+    }),
+    signal: AbortSignal.timeout(20_000),
+  });
+
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`OpenAI API error: ${response.status} ${error.slice(0, 200)}`);
+  }
+
+  const result = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  return String(result.choices?.[0]?.message?.content ?? "").trim();
+}
+
+// ─── OpenAI connection test (BYO key setup) ───────────────────
+
+/**
+ * 1-token chat ping to verify a key can actually generate. Never throws —
+ * always returns an ok/failed verdict with a user-facing message.
+ */
+export async function pingOpenAi(
+  apiKey: string,
+): Promise<{ ok: boolean; message: string }> {
+  try {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        max_tokens: 1,
+        messages: [{ role: "user", content: "ping" }],
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (response.ok) {
+      return {
+        ok: true,
+        message: "Connection OK — real AI drafting is active for your firm.",
+      };
+    }
+    const body = await response.text();
+    if (response.status === 401) {
+      return {
+        ok: false,
+        message:
+          "OpenAI rejected this key (401 invalid). Double-check that you copied the complete key.",
+      };
+    }
+    return {
+      ok: false,
+      message: `OpenAI returned ${response.status}: ${body.slice(0, 160)}`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      message: `Couldn't reach OpenAI: ${err instanceof Error ? err.message : "unknown error"}`,
+    };
+  }
+}
+
 // ─── OpenAI Integration ───────────────────────────────────────
 
 async function generateWithOpenAI(
   systemPrompt: string,
   caseDetails: Record<string, string>,
+  apiKey: string,
 ): Promise<GenerateDocumentResult> {
   const detailsText = Object.entries(caseDetails)
     .map(([key, value]) => `${key}: ${value}`)
@@ -78,7 +192,7 @@ async function generateWithOpenAI(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",

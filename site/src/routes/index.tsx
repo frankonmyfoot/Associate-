@@ -1,25 +1,24 @@
 import { Link, createFileRoute } from "@tanstack/react-router";
 
 import SiteHeader from "~/components/site-header";
-import { getPublicConfig } from "~/lib/server";
+import { getSessionUser } from "~/lib/server";
 
 export const Route = createFileRoute("/")({
   loader: async () => {
     try {
-      const cfg = await getPublicConfig();
-      return { hasClerk: Boolean(cfg.clerkPublishableKey) };
+      return { user: await getSessionUser() };
     } catch {
-      return { hasClerk: false };
+      return { user: null };
     }
   },
   component: Home,
 });
 
 function Home() {
-  const { hasClerk } = Route.useLoaderData();
+  const { user } = Route.useLoaderData();
   return (
     <div className="flex min-h-screen flex-col">
-      <SiteHeader hasClerk={hasClerk} />
+      <SiteHeader user={user} />
 
       {/* Hero */}
       <section className="flex-1">
@@ -36,10 +35,10 @@ function Home() {
             </p>
             <div className="mt-10 flex items-center justify-center gap-4">
               <Link
-                to="/sign-up"
+                to="/pricing"
                 className="rounded-lg bg-primary-600 px-8 py-3 text-sm font-medium text-white hover:bg-primary-700"
               >
-                Start Free Trial
+                See Pricing
               </Link>
               <a
                 href="#features"
@@ -120,10 +119,10 @@ function Home() {
                   />
                 </svg>
               </div>
-              <h3 className="text-lg font-semibold">Secure & Compliant</h3>
+              <h3 className="text-lg font-semibold">Secure by Design</h3>
               <p className="mt-2 text-sm text-muted-foreground">
-                Enterprise-grade security with multi-tenant isolation. Your data
-                is encrypted at rest and in transit.
+                Multi-tenant isolation keeps each firm's data separate from every
+                other firm. Encrypted connection in transit.
               </p>
             </div>
           </div>

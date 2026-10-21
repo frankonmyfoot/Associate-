@@ -1,40 +1,26 @@
 import { useState } from "react";
-import { useNavigate, createFileRoute } from "@tanstack/react-router";
-import { useUser } from "@clerk/clerk-react";
+import { useNavigate, createFileRoute, redirect } from "@tanstack/react-router";
 
-import { GatePanel } from "~/components/ui";
-import { getPublicConfig, onboardFirm } from "~/lib/server";
+import { getSessionUser, onboardFirm } from "~/lib/server";
 
 export const Route = createFileRoute("/onboarding")({
   loader: async () => {
-    try {
-      const cfg = await getPublicConfig();
-      return { clerkKey: cfg.clerkPublishableKey };
-    } catch {
-      return { clerkKey: null };
+    const user = await getSessionUser().catch(() => null);
+    if (!user) {
+      throw redirect({ to: "/sign-in" });
     }
+    return { user };
   },
   component: OnboardingPage,
 });
 
 export default function OnboardingPage() {
-  const { clerkKey } = Route.useLoaderData();
-
-  // No Clerk hooks above this gate — useUser() throws without a provider.
-  if (!clerkKey) {
-    return (
-      <GatePanel
-        title="Authentication not configured yet"
-        message="Firm onboarding requires a signed-in account, and this deployment doesn't have Clerk keys connected yet. Once the owner connects Clerk keys, this wizard signs your firm up end-to-end."
-      />
-    );
-  }
-  return <OnboardingWizard />;
+  const { user } = Route.useLoaderData();
+  return <OnboardingWizard userName={user.name} />;
 }
 
-function OnboardingWizard() {
+function OnboardingWizard({ userName }: { userName: string }) {
   const navigate = useNavigate();
-  const { user, isLoaded } = useUser();
   const [step, setStep] = useState(1);
   const [firmName, setFirmName] = useState("");
   const [practiceAreas, setPracticeAreas] = useState("");
@@ -44,7 +30,6 @@ function OnboardingWizard() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user) return;
 
     setSubmitting(true);
     setError("");
@@ -55,8 +40,6 @@ function OnboardingWizard() {
           firmName,
           practiceAreas,
           teamSize,
-          userName: user.fullName ?? user.username ?? "",
-          userEmail: user.primaryEmailAddress?.emailAddress ?? "",
         },
       });
       await navigate({ to: "/dashboard" });
@@ -76,17 +59,10 @@ function OnboardingWizard() {
           </div>
           <h1 className="text-2xl font-bold">Welcome to AssociateAI</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            {isLoaded && !user
-              ? "Sign in first — then this wizard sets up your firm."
-              : "Let's set up your firm in just a few steps."}
+            {userName ? `Signed in as ${userName}. ` : ""}
+            Let's set up your firm in just a few steps.
           </p>
         </div>
-
-        {(!isLoaded || !user) && (
-          <p className="mb-6 text-center text-sm text-red-600">
-            You need to sign in before completing onboarding.
-          </p>
-        )}
 
         <div className="mb-8 flex items-center justify-center gap-2">
           {[1, 2, 3].map((s) => (

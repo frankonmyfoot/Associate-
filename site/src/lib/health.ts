@@ -32,13 +32,13 @@ export async function buildHealthResponse(request: Request): Promise<Response> {
 
   // Candidate secret names — presence only.
   const candidates = [
-    "CLERK_SECRET_KEY",
-    "CLERK_PUBLISHABLE_KEY",
-    "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
-    "VITE_CLERK_PUBLISHABLE_KEY",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "DATABASE_URL",
+    "STRIPE_SECRET_KEY",
+    "STRIPE_WEBHOOK_SECRET",
+    "STRIPE_PRICE_STARTER",
+    "STRIPE_PRICE_PRO",
   ];
   const present: Record<string, boolean> = {};
   for (const name of candidates) {

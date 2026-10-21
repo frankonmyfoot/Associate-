@@ -4,10 +4,9 @@
  * All server logic lives in `createServerFn()` handlers — TanStack Start's
  * supported server-logic pattern in this version (file-based API routes no
  * longer exist here; only the health endpoint is a raw path, intercepted in
- * serve.ts). Auth is Clerk: the session token from the `__session` cookie (or
- * Authorization header) is verified with @clerk/backend `verifyToken` — see
- * `currentUserId()`. Everything is key-optional: with no Clerk secret key the
- * server treats requests as signed out instead of failing.
+ * serve.ts). Auth is built-in email+password (see src/lib/auth.ts): the
+ * session cookie holds a random token, the DB stores only its hash. There are
+ * no auth env vars — sign-up/sign-in work the moment this deploys.
  *
  * DB: team-db CLI via src/lib/db.ts. One SQL statement per team-db call —
  * aggregate reads are consolidated into single statements with scalar
@@ -16,7 +15,6 @@
 
 import { createServerFn } from "@tanstack/react-start";
 import { getRequest } from "@tanstack/react-start/server";
-import { verifyToken } from "@clerk/backend";
 
 import {
   ensureSchema,
@@ -27,7 +25,18 @@ import {
   lit,
   query,
 } from "~/lib/db";
-import { generateDocument } from "~/lib/ai";
+import {
+  endSession,
+  getSessionUserRow,
+  hashPassword,
+  startSession,
+  verifyPassword,
+} from "~/lib/auth";
+import {
+  generateDocument,
+  generateIntakeSummary,
+  pingOpenAi,
+} from "~/lib/ai";
 import { getDocumentType } from "~/lib/documents";
 import {
   billingConfigured,
@@ -39,46 +48,11 @@ import {
 import { PLANS, type PlanId } from "~/lib/plans";
 import type { DocumentType, IntakeField, IntakeFieldType } from "~/lib/types";
 
-// ─── Clerk configuration ──────────────────────────────────────
-
-interface ClerkKeys {
-  publishableKey: string | null;
-  secretKey: string | null;
-}
-
-function clerkServerKeys(): ClerkKeys {
-  const publishableKey =
-    process.env.CLERK_PUBLISHABLE_KEY ||
-    process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ||
-    process.env.VITE_CLERK_PUBLISHABLE_KEY ||
-    null;
-  const secretKey = process.env.CLERK_SECRET_KEY || null;
-  return { publishableKey, secretKey };
-}
-
-function cookieToken(req: Request): string | null {
-  const cookie = req.headers.get("cookie") ?? "";
-  for (const part of cookie.split(";")) {
-    const [name, ...rest] = part.trim().split("=");
-    if (name === "__session") return decodeURIComponent(rest.join("=")) || null;
-  }
-  return null;
-}
+// ─── Auth (built-in email+password sessions) ──────────────────
 
 async function currentUserId(): Promise<string | null> {
-  const { secretKey } = clerkServerKeys();
-  if (!secretKey) return null;
-  try {
-    const req = getRequest();
-    const token =
-      req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
-      cookieToken(req);
-    if (!token) return null;
-    const claims = await verifyToken(token, { secretKey });
-    return claims?.sub ?? null;
-  } catch {
-    return null;
-  }
+  const user = await getSessionUserRow();
+  return user?.id ?? null;
 }
 
 // ─── Small helpers ────────────────────────────────────────────
@@ -179,16 +153,119 @@ function slugify(name: string): string {
     .replace(/^-|-$/g, "");
 }
 
-// ─── Public config (for key-optional Clerk) ───────────────────
+// ─── Auth server functions ────────────────────────────────────
 
-export const getPublicConfig = createServerFn({ method: "GET" }).handler(
-  async () => {
-    const { publishableKey } = clerkServerKeys();
-    return { clerkPublishableKey: publishableKey };
+export interface SessionUser {
+  id: string;
+  email: string;
+  name: string;
+  firmId: string | null;
+  role: string;
+}
+
+/** Resolves the signed-in user for the current request; null when signed out. */
+export const getSessionUser = createServerFn({ method: "GET" }).handler(
+  async (): Promise<SessionUser | null> => {
+    const user = await getSessionUserRow();
+    if (!user) return null;
+    return {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      firmId: user.firm_id,
+      role: user.role,
+    };
   },
 );
 
-// ─── Auth / onboarding ────────────────────────────────────────
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Creates the account + the firm workspace (billing fields null, plan
+ * defaults to 'starter'), starts the session, and hands the client off to
+ * onboarding — which then fills in the firm's details.
+ */
+export const signUp = createServerFn({ method: "POST" })
+  .validator(
+    (input: unknown) => input as { email?: string; password?: string; name?: string },
+  )
+  .handler(async ({ data }) => {
+    await ensureSchema();
+    const email = (data.email ?? "").trim().toLowerCase();
+    const password = data.password ?? "";
+    const name = (data.name ?? "").trim().slice(0, 200);
+    if (!EMAIL_RE.test(email))
+      throw new Error("Enter a valid email address.");
+    if (password.length < 8)
+      throw new Error("Password must be at least 8 characters.");
+    if (password.length > 200) throw new Error("Password is too long.");
+
+    // The UNIQUE index on email is the duplicate guard — no pre-check race.
+    const userId = generateId();
+    try {
+      await execute(
+        `INSERT INTO users (id, email, password_hash, name, role, created_at, updated_at)
+         VALUES ('${userId}', '${esc(email)}', '${esc(hashPassword(password))}', '${esc(name || email.split("@")[0] || "Firm Admin")}', 'admin', datetime('now'), datetime('now'))`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (/UNIQUE/i.test(msg))
+        throw new Error(
+          "An account with this email already exists — sign in instead.",
+        );
+      throw new Error("Could not create the account. Please try again.");
+    }
+
+    // Provision the firm right away so the dashboard has a workspace; the
+    // onboarding wizard renames it with the details collected there.
+    const firmId = generateId();
+    const slug = `firm-${generateId().slice(0, 12)}`;
+    await execute(
+      `INSERT INTO firms (id, name, slug, created_at, updated_at)
+       VALUES ('${firmId}', 'New Firm', '${esc(slug)}', datetime('now'), datetime('now'))`,
+    );
+    await execute(
+      `UPDATE users SET firm_id = '${firmId}' WHERE id = '${userId}'`,
+    );
+
+    await startSession(userId);
+    return { ok: true as const, redirect: "/onboarding" as const };
+  });
+
+export const signIn = createServerFn({ method: "POST" })
+  .validator((input: unknown) => input as { email?: string; password?: string })
+  .handler(async ({ data }) => {
+    await ensureSchema();
+    const email = (data.email ?? "").trim().toLowerCase();
+    const password = data.password ?? "";
+    const rows = await query<{
+      id: string;
+      password_hash: string;
+      firm_id: string | null;
+    }>(
+      `SELECT id, password_hash, firm_id FROM users WHERE email = '${esc(email)}' LIMIT 1`,
+    );
+    const user = rows[0];
+    if (!user || !verifyPassword(password, user.password_hash)) {
+      throw new Error("Email or password is incorrect.");
+    }
+    await startSession(user.id);
+    return {
+      ok: true as const,
+      redirect: (user.firm_id ? "/dashboard" : "/onboarding") as
+        | "/dashboard"
+        | "/onboarding",
+    };
+  });
+
+export const signOut = createServerFn({ method: "POST" }).handler(
+  async () => {
+    await endSession();
+    return { ok: true as const, redirect: "/" as const };
+  },
+);
+
+// ─── Firm resolution ──────────────────────────────────────────
 
 async function firmForUser(userId: string) {
   const rows = await query<{
@@ -202,11 +279,83 @@ async function firmForUser(userId: string) {
   }>(
     `SELECT f.id, f.name, f.plan, f.slug, f.stripe_customer_id, f.subscription_status, f.current_period_end
      FROM firms f
-     JOIN firm_users fu ON fu.firm_id = f.id
-     WHERE fu.clerk_user_id = '${esc(userId)}' LIMIT 1`,
+     JOIN users u ON u.firm_id = f.id
+     WHERE u.id = '${esc(userId)}' LIMIT 1`,
   );
   return rows[0] ?? null;
 }
+
+// ─── BYO OpenAI key ───────────────────────────────────────────
+
+function maskKey(key: string): string {
+  const trimmed = key.trim();
+  if (trimmed.length <= 8) return "••••";
+  return `${trimmed.slice(0, 3)}…${trimmed.slice(-4)}`;
+}
+
+/**
+ * Effective OpenAI key for a firm: the firm's own BYO key first, then the
+ * platform OPENAI_API_KEY env var. Null when neither exists (template
+ * fallback kicks in).
+ */
+async function resolveOpenAiKey(firmId: string): Promise<string | null> {
+  const rows = await query<{ k: string | null }>(
+    `SELECT openai_api_key AS k FROM firms WHERE id = '${esc(firmId)}' LIMIT 1`,
+  );
+  const byo = rows[0]?.k?.trim();
+  if (byo) return byo;
+  const envKey = process.env.OPENAI_API_KEY?.trim();
+  return envKey || null;
+}
+
+/** Stores the firm's own OpenAI API key (server-side only, never returned raw). */
+export const saveOpenAiKey = createServerFn({ method: "POST" })
+  .validator((input: unknown) => input as { apiKey?: string })
+  .handler(async ({ data }) => {
+    const user = await getSessionUserRow();
+    const firm = user?.firm_id ? await firmForUser(user.id) : null;
+    if (!firm) throw new Error("Complete onboarding first.");
+    const apiKey = (data.apiKey ?? "").trim();
+    if (!/^sk-[A-Za-z0-9_-]{20,}$/.test(apiKey))
+      throw new Error(
+        "That doesn't look like an OpenAI API key — keys start with 'sk-'.",
+      );
+    await execute(
+      `UPDATE firms SET openai_api_key = '${esc(apiKey)}', updated_at = datetime('now') WHERE id = '${esc(firm.id)}'`,
+    );
+    return { ok: true as const, maskedKey: maskKey(apiKey) };
+  });
+
+/** Clears the firm's BYO OpenAI key. */
+export const clearOpenAiKey = createServerFn({ method: "POST" }).handler(
+  async () => {
+    const user = await getSessionUserRow();
+    const firm = user?.firm_id ? await firmForUser(user.id) : null;
+    if (!firm) throw new Error("Complete onboarding first.");
+    await execute(
+      `UPDATE firms SET openai_api_key = NULL, updated_at = datetime('now') WHERE id = '${esc(firm.id)}'`,
+    );
+    return { ok: true as const };
+  },
+);
+
+/** 1-token ping against the effective key (BYO first, else platform env). */
+export const testOpenAiKey = createServerFn({ method: "POST" }).handler(
+  async () => {
+    const user = await getSessionUserRow();
+    const firm = user?.firm_id ? await firmForUser(user.id) : null;
+    if (!firm) throw new Error("Complete onboarding first.");
+    const key = await resolveOpenAiKey(firm.id);
+    if (!key) {
+      return {
+        ok: false as const,
+        message:
+          "Nothing to test yet — save your firm's OpenAI API key first (no platform key is configured either).",
+      };
+    }
+    return pingOpenAi(key);
+  },
+);
 
 // ─── Plan gating ─────────────────────────────────────────────
 
@@ -215,7 +364,7 @@ type LimitKind = "users" | "intakeSubmissions" | "documentGenerations";
 const UPGRADE_HINT = "View plans at /pricing or ask your firm admin to upgrade.";
 
 /**
- * Enforces the firm's plan limits (read from the firm record, not Clerk).
+ * Enforces the firm's plan limits (read from the firm record, not the session).
  * Throws a friendly, user-facing message — never a raw error/stack. Pro (and
  * Enterprise) are unlimited; Starter: 3 users, 100 intakes/mo, 50 docs/mo.
  */
@@ -235,7 +384,7 @@ async function assertWithinPlanLimit(
   let used: number;
   if (kind === "users") {
     const rows = await query<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM firm_users WHERE firm_id = '${esc(firm.id)}'`,
+      `SELECT COUNT(*) AS count FROM users WHERE firm_id = '${esc(firm.id)}'`,
     );
     used = Number(rows[0]?.count ?? 0);
   } else {
@@ -261,36 +410,31 @@ async function assertWithinPlanLimit(
 }
 
 export interface DashboardAuthState {
-  mode: "no-keys" | "signed-out" | "no-firm" | "ok";
+  mode: "signed-out" | "no-firm" | "ok";
   firmName?: string;
   userName?: string;
-  clerkKey?: boolean;
+  userEmail?: string;
 }
 
 export const getDashboardAuthState = createServerFn({
   method: "GET",
 }).handler(async (): Promise<DashboardAuthState> => {
   await ensureSchema();
-  const { publishableKey } = clerkServerKeys();
-  if (!publishableKey) {
-    return { mode: "no-keys", clerkKey: false };
+  const user = await getSessionUserRow();
+  if (!user) {
+    return { mode: "signed-out" };
   }
-  const userId = await currentUserId();
-  if (!userId) {
-    return { mode: "signed-out", clerkKey: true };
+  if (!user.firm_id) {
+    return { mode: "no-firm", userName: user.name, userEmail: user.email };
   }
-  const firm = await firmForUser(userId);
-  if (!firm) {
-    return { mode: "no-firm", clerkKey: true };
-  }
-  const users = await query<{ name: string }>(
-    `SELECT name FROM firm_users WHERE clerk_user_id = '${esc(userId)}' LIMIT 1`,
+  const firmRows = await query<{ name: string }>(
+    `SELECT name FROM firms WHERE id = '${esc(user.firm_id)}' LIMIT 1`,
   );
   return {
     mode: "ok",
-    clerkKey: true,
-    firmName: firm.name,
-    userName: users[0]?.name ?? "",
+    firmName: firmRows[0]?.name ?? "My Firm",
+    userName: user.name,
+    userEmail: user.email,
   };
 });
 
@@ -301,23 +445,18 @@ export const onboardFirm = createServerFn({ method: "POST" })
         firmName: string;
         practiceAreas?: string;
         teamSize?: string;
-        userName?: string;
-        userEmail?: string;
       },
   )
   .handler(async ({ data }) => {
     await ensureSchema();
-    const userId = await currentUserId();
-    if (!userId) {
+    const user = await getSessionUserRow();
+    if (!user) {
       throw new Error(
-        "Sign-in is not available on this deployment yet — Clerk keys are not connected, so firms cannot be created.",
+        "Please sign in first — create an account, then complete onboarding.",
       );
     }
     const firmName = (data.firmName ?? "").trim().slice(0, 200);
     if (!firmName) throw new Error("Firm name is required");
-
-    const existing = await firmForUser(userId);
-    if (existing) return { firmId: existing.id };
 
     const practiceAreas = (data.practiceAreas ?? "").trim().slice(0, 2000);
     const teamSizeRaw = (data.teamSize ?? "").trim();
@@ -333,6 +472,18 @@ export const onboardFirm = createServerFn({ method: "POST" })
               ? 1
               : null;
 
+    // Sign-up already provisioned the firm workspace — the wizard fills in
+    // the details on the existing firm record.
+    if (user.firm_id) {
+      await execute(
+        `UPDATE firms SET name = '${esc(firmName)}', practice_areas = ${lit(practiceAreas || null)}, team_size = ${teamSizeNum == null ? "NULL" : String(teamSizeNum)}, updated_at = datetime('now')
+         WHERE id = '${esc(user.firm_id)}'`,
+      );
+      return { firmId: user.firm_id };
+    }
+
+    // Safety net: a user without a firm (shouldn't happen with sign-up
+    // provisioning) still gets one created and linked here.
     const baseSlug = slugify(firmName) || "firm";
     let slug = baseSlug;
     let firmId = generateId();
@@ -355,8 +506,7 @@ export const onboardFirm = createServerFn({ method: "POST" })
     }
 
     await execute(
-      `INSERT INTO firm_users (id, firm_id, clerk_user_id, email, name, role, created_at, updated_at)
-       VALUES ('${generateId()}', '${firmId}', '${esc(userId)}', ${lit((data.userEmail ?? "").trim().slice(0, 320) || null)}, ${lit((data.userName ?? "").trim().slice(0, 200) || "Firm Admin")}, 'admin', datetime('now'), datetime('now'))`,
+      `UPDATE users SET firm_id = '${firmId}', role = 'admin' WHERE id = '${esc(user.id)}'`,
     );
 
     return { firmId, slug };
@@ -635,9 +785,29 @@ export const submitIntake = createServerFn({ method: "POST" })
 
     const id = generateId();
     const caseSummary = generateCaseSummary(submittedData, fields);
+    // Prefer an AI-written summary (firm BYO key → platform key); the
+    // deterministic summary above is the fallback so submissions never fail
+    // because of the AI path.
+    let finalSummary = caseSummary;
+    try {
+      const aiKey = await resolveOpenAiKey(firmId);
+      if (aiKey) {
+        const aiSummary = await generateIntakeSummary(
+          aiKey,
+          submittedData,
+          fields,
+        );
+        if (aiSummary) finalSummary = aiSummary.slice(0, 4000);
+      }
+    } catch (err) {
+      console.warn(
+        "AI intake summary failed; keeping deterministic summary:",
+        err instanceof Error ? err.message : err,
+      );
+    }
     await execute(
       `INSERT INTO intake_submissions (id, form_id, firm_id, data, case_summary, status, created_at)
-       VALUES ('${id}', '${esc(data.formId)}', '${esc(firmId)}', '${esc(JSON.stringify(submittedData))}', '${esc(caseSummary)}', 'pending', datetime('now'))`,
+       VALUES ('${id}', '${esc(data.formId)}', '${esc(firmId)}', '${esc(JSON.stringify(submittedData))}', '${esc(finalSummary)}', 'pending', datetime('now'))`,
     );
     return { id };
   });
@@ -777,10 +947,14 @@ export const generateDocumentFn = createServerFn({ method: "POST" })
     }
     if (Object.keys(caseDetails).length === 0)
       throw new Error("Case details are required");
-    return generateDocument({
-      documentType: data.documentType as DocumentType,
-      caseDetails,
-    });
+    const openAiKey = await resolveOpenAiKey(firm.id);
+    return generateDocument(
+      {
+        documentType: data.documentType as DocumentType,
+        caseDetails,
+      },
+      { openAiKey },
+    );
   });
 
 export const saveDocument = createServerFn({ method: "POST" })
@@ -916,7 +1090,7 @@ export const getSettingsData = createServerFn({ method: "GET" }).handler(
     );
     const f = firmRows[0] ?? {};
     const members = await query<Record<string, unknown>>(
-      `SELECT id, email, name, role, created_at FROM firm_users
+      `SELECT id, email, name, role, created_at FROM users
        WHERE firm_id = '${esc(firm.id)}' ORDER BY created_at ASC`,
     );
     const countRows = await query<Record<string, unknown>>(
@@ -938,6 +1112,13 @@ export const getSettingsData = createServerFn({ method: "GET" }).handler(
         stripeCustomerId: text(f.stripe_customer_id),
         subscriptionStatus: text(f.subscription_status),
         currentPeriodEnd: text(f.current_period_end),
+      },
+      ai: {
+        byoConfigured: Boolean(text(f.openai_api_key).trim()),
+        maskedKey: text(f.openai_api_key).trim()
+          ? maskKey(text(f.openai_api_key))
+          : null,
+        platformKeyPresent: Boolean(process.env.OPENAI_API_KEY?.trim()),
       },
       members: members.map((m) => ({
         id: text(m.id),
@@ -1019,8 +1200,8 @@ export const startCheckout = createServerFn({ method: "POST" })
     (input: unknown) => input as { plan: "starter" | "pro"; userEmail?: string },
   )
   .handler(async ({ data }) => {
-    const userId = await currentUserId();
-    const firm = userId ? await firmForUser(userId) : null;
+    const user = await getSessionUserRow();
+    const firm = user?.firm_id ? await firmForUser(user.id) : null;
     if (!firm)
       throw new Error(
         "Your firm isn't set up yet — finish onboarding first, then subscribe.",
@@ -1036,7 +1217,8 @@ export const startCheckout = createServerFn({ method: "POST" })
     const result = await createCheckoutSession({
       firmId: firm.id,
       firmName: firm.name,
-      customerEmail: (data.userEmail ?? "").trim(),
+      // Prefill from the signed-in account — never trust a client-supplied email.
+      customerEmail: user?.email ?? "",
       plan: data.plan as PurchasablePlan,
       origin: requestOrigin(),
       existingCustomerId: firm.stripe_customer_id ?? null,

@@ -61,7 +61,6 @@ export interface Firm {
 export interface FirmUser {
   id: string;
   firmId: string;
-  clerkUserId: string;
   email: string;
   name: string;
   role: "admin" | "attorney" | "paralegal" | "staff";

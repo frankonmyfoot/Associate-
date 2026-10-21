@@ -79,6 +79,8 @@ export function generateId(): string {
 const SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS firms (id TEXT PRIMARY KEY, name TEXT NOT NULL, slug TEXT NOT NULL UNIQUE, plan TEXT NOT NULL DEFAULT 'starter', practice_areas TEXT, team_size INTEGER, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS firm_users (id TEXT PRIMARY KEY, firm_id TEXT NOT NULL REFERENCES firms(id), clerk_user_id TEXT NOT NULL UNIQUE, email TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'attorney' CHECK(role IN ('admin','attorney','paralegal','staff')), created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', firm_id TEXT REFERENCES firms(id), role TEXT NOT NULL DEFAULT 'admin' CHECK(role IN ('admin','attorney','paralegal','staff')), created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), token_hash TEXT NOT NULL UNIQUE, expires_at TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS intake_forms (id TEXT PRIMARY KEY, firm_id TEXT NOT NULL REFERENCES firms(id), title TEXT NOT NULL, description TEXT, fields TEXT NOT NULL DEFAULT '[]', is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS intake_submissions (id TEXT PRIMARY KEY, form_id TEXT NOT NULL REFERENCES intake_forms(id), firm_id TEXT NOT NULL REFERENCES firms(id), data TEXT NOT NULL DEFAULT '{}', case_summary TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','reviewed','archived')), created_at TEXT NOT NULL DEFAULT (datetime('now')), reviewed_at TEXT)`,
   `CREATE TABLE IF NOT EXISTS document_drafts (id TEXT PRIMARY KEY, firm_id TEXT NOT NULL REFERENCES firms(id), title TEXT NOT NULL, document_type TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', case_details TEXT, source_submission_id TEXT REFERENCES intake_submissions(id), status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft','finalized','archived')), created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now')))`,
@@ -87,10 +89,10 @@ const SCHEMA_STATEMENTS = [
 let schemaPromise: Promise<void> | null = null;
 
 /**
- * Adds billing columns to `firms` if missing (SQLite has no IF NOT EXISTS for
+ * Adds per-firm columns to `firms` if missing (SQLite has no IF NOT EXISTS for
  * ADD COLUMN — check pragma, then alter). Idempotent and cached per process.
  */
-async function migrateBillingColumns(): Promise<void> {
+async function migrateFirmColumns(): Promise<void> {
   const cols = await query<{ name: string }>(
     "SELECT name FROM pragma_table_info('firms')",
   );
@@ -99,6 +101,7 @@ async function migrateBillingColumns(): Promise<void> {
     ["stripe_customer_id", "TEXT"],
     ["subscription_status", "TEXT"],
     ["current_period_end", "TEXT"],
+    ["openai_api_key", "TEXT"],
   ];
   for (const [name, type] of wanted) {
     if (!have.has(name)) {
@@ -114,7 +117,7 @@ export function ensureSchema(): Promise<void> {
       for (const stmt of SCHEMA_STATEMENTS) {
         await execute(stmt);
       }
-      await migrateBillingColumns();
+      await migrateFirmColumns();
     })().catch((err) => {
       schemaPromise = null; // allow retry after a transient failure
       throw err;
