@@ -3,6 +3,7 @@ import { useNavigate, createFileRoute } from "@tanstack/react-router";
 
 import { DOCUMENT_TYPES, type DocumentType } from "~/lib/documents";
 import { generateDocumentFn, saveDocument } from "~/lib/server";
+import DateField from "~/components/date-field";
 
 export const Route = createFileRoute("/dashboard/documents/new")({
   component: NewDocumentPage,
@@ -183,10 +184,16 @@ export default function NewDocumentPage() {
                         </option>
                       ))}
                     </select>
+                  ) : field.type === "date" ? (
+                    <DateField
+                      id={`doc-${field.id}`}
+                      value={caseDetails[field.id] ?? ""}
+                      onChange={(v) => handleFieldChange(field.id, v)}
+                    />
                   ) : (
                     <input
                       id={`doc-${field.id}`}
-                      type={field.type === "date" ? "date" : "text"}
+                      type="text"
                       value={caseDetails[field.id] ?? ""}
                       onChange={(e) => handleFieldChange(field.id, e.target.value)}
                       className="mt-1 block w-full rounded-lg border px-3 py-2 text-sm"
