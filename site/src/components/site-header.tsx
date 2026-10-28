@@ -29,6 +29,12 @@ export default function SiteHeader({ user }: { user?: SessionUser | null }) {
         </Link>
         <nav className="flex items-center gap-4">
           <Link
+            to="/demo"
+            className="text-sm font-medium text-muted-foreground hover:text-foreground"
+          >
+            Live Demo
+          </Link>
+          <Link
             to="/pricing"
             className="text-sm font-medium text-muted-foreground hover:text-foreground"
           >

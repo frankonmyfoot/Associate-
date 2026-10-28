@@ -33,10 +33,16 @@ function Home() {
               letters to contracts — so you can focus on practicing law, not
               paperwork.
             </p>
-            <div className="mt-10 flex items-center justify-center gap-4">
+            <div className="mt-10 flex flex-wrap items-center justify-center gap-4">
+              <Link
+                to="/demo"
+                className="rounded-lg bg-primary-600 px-8 py-3 text-sm font-medium text-white hover:bg-primary-700"
+              >
+                Try the Live Demo
+              </Link>
               <Link
                 to="/pricing"
-                className="rounded-lg bg-primary-600 px-8 py-3 text-sm font-medium text-white hover:bg-primary-700"
+                className="rounded-lg border px-8 py-3 text-sm font-medium hover:bg-muted"
               >
                 See Pricing
               </Link>
