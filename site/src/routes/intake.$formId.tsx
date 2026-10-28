@@ -3,6 +3,7 @@ import { useNavigate, createFileRoute } from "@tanstack/react-router";
 
 import { getPublicIntakeForm, submitIntake } from "~/lib/server";
 import type { IntakeField } from "~/lib/types";
+import DateField from "~/components/date-field";
 
 export const Route = createFileRoute("/intake/$formId")({
   loader: async ({ params }) => {
@@ -96,13 +97,10 @@ function PublicIntakeFormPage() {
         );
       case "date":
         return (
-          <input
+          <DateField
             id={inputId}
-            type="date"
             value={value}
-            onChange={(e) => onChange(e.target.value)}
-            className="mt-1 block w-full rounded-lg border px-3 py-2 text-sm"
-            required={field.required}
+            onChange={onChange}
           />
         );
       case "email":
