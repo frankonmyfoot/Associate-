@@ -38,6 +38,7 @@ import {
   pingOpenAi,
 } from "~/lib/ai";
 import { getDocumentType } from "~/lib/documents";
+import { DEMO_INTAKE_FIELDS, demoTemplateSummary } from "~/lib/demo";
 import {
   billingConfigured,
   createCheckoutSession,
@@ -1240,3 +1241,62 @@ export const startPortal = createServerFn({ method: "POST" }).handler(
     return { ok: true as const, url: result.url };
   },
 );
+
+// ─── Public demo (/demo — no auth, NO STORAGE) ────────────────
+
+export interface DemoSummaryResult {
+  summary: string;
+  /** "ai" — generated via generateIntakeSummary with a platform OpenAI key;
+   *  "template" — the deterministic fallback when no key is configured. */
+  source: "ai" | "template";
+}
+
+/**
+ * Runs the demo intake through the SAME summary pipeline real submissions
+ * use — generateIntakeSummary with the platform OpenAI key when one exists,
+ * the deterministic template otherwise — and returns the text WITHOUT
+ * persisting anything. This handler makes no database calls: nothing a demo
+ * visitor enters is saved or sent anywhere.
+ */
+export const generateDemoSummary = createServerFn({ method: "POST" })
+  .validator((input: unknown) => input as { data: Record<string, string> })
+  .handler(async ({ data }): Promise<DemoSummaryResult> => {
+    // Only values for the known demo fields, size-capped — same input hygiene
+    // as the real intake path.
+    const submitted: Record<string, string> = {};
+    for (const field of DEMO_INTAKE_FIELDS) {
+      const value = text(data.data?.[field.id]).slice(0, 10_000).trim();
+      if (field.required && !value) {
+        throw new Error(`"${field.label}" is required.`);
+      }
+      if (value) submitted[field.id] = value;
+    }
+    if (Object.keys(submitted).length === 0) {
+      throw new Error("Fill in the form to see the case summary.");
+    }
+
+    // No firm context on the demo — the platform OpenAI key is the only AI
+    // path (real firms additionally get their BYO key via resolveOpenAiKey).
+    const platformKey = process.env.OPENAI_API_KEY?.trim();
+    if (platformKey) {
+      try {
+        const aiSummary = await generateIntakeSummary(
+          platformKey,
+          submitted,
+          DEMO_INTAKE_FIELDS,
+        );
+        if (aiSummary) {
+          return { summary: aiSummary.slice(0, 4000), source: "ai" as const };
+        }
+      } catch (err) {
+        console.warn(
+          "Demo AI summary failed; using the template fallback:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+    return {
+      summary: demoTemplateSummary(submitted),
+      source: "template" as const,
+    };
+  });

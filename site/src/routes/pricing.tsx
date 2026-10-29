@@ -43,6 +43,17 @@ function PricingPage() {
               Monthly subscriptions for solo practitioners and small firms.
               Cancel anytime from your billing portal.
             </p>
+            <p className="mx-auto mt-3 max-w-2xl text-sm text-muted-foreground">
+              Want to see the product first?{" "}
+              <Link
+                to="/demo"
+                className="font-medium text-primary-600 hover:text-primary-700"
+              >
+                See it live
+              </Link>{" "}
+              — fill a sample client intake and watch the case summary appear.
+              No sign-up.
+            </p>
           </div>
 
           {/* The plan grid always renders (public marketing); only the
